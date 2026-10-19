@@ -33,9 +33,13 @@ enum : uintptr_t {
     kRendererInit = 0x256780, kModeFilter = 0x256885, kModeAccept = 0x2568a3, kModeReject = 0x2568b0,
     kSetViewport = 0x255140, kCameraFov = 0x31056d, kCameraFovEnd = 0x3105cc, kEffectFov = 0x1eaefe,
     kEffectFovEnd = 0x1eaf48, kTriggerFov = 0x395eee, kTriggerFovEnd = 0x395f33, kConst43 = 0x6af018,
-    kRendererPtr = 0x945f30,
+    kRendererPtr = 0x945f30, kGuiAspect = 0x25c60d, kSetPhysicalViewport = 0x25c5c0, kCrosshairMul = 0x2dc44e,
+    kScopeDiv = 0x3bf4ff, kDropAspect = 0x3ba871, kDropAspectEnd = 0x3ba877,
 };
 static const uintptr_t kGrass43[4] = {0x22b1e4, 0x22b8ac, 0x22c969, 0x22e9de};
+static const uintptr_t kQuadSites[4] = {0x22fb43, 0x22fb4b, 0x2303d3, 0x2303db};  // movss xmm, [+-7000]
+template <typename T>
+static T* Operand(uintptr_t rva, size_t at) { return *reinterpret_cast<T**>(g_base + rva + at); }
 
 static void WriteJmp(uintptr_t at, const void* dest) {
     DWORD old;
@@ -105,6 +109,12 @@ __declspec(naked) void CatchAccept() {
 }
 __declspec(naked) void CatchReject() {
     __asm mov g_catchWhich, 2
+    __asm jmp CatchBlock
+}
+// Blocks that leave their result on the x87 stack.
+static float g_x87Out;
+__declspec(naked) void CatchX87() {
+    __asm fstp g_x87Out
     __asm jmp CatchBlock
 }
 
@@ -187,8 +197,16 @@ int main(int argc, char** argv) {
     auto setFov = reinterpret_cast<SetFovFn>(GetProcAddress(mod, "dh2013ws_test_setfov"));
 
     printf("patches\n");
-    for (uintptr_t site : std::initializer_list<uintptr_t>{kModeFilter, kCameraFov, kEffectFov, kTriggerFov, kSetViewport, kRendererInit})
+    for (uintptr_t site : std::initializer_list<uintptr_t>{kModeFilter, kCameraFov, kEffectFov, kTriggerFov, kSetViewport,
+                                                          kRendererInit, kGuiAspect, kDropAspect})
         CHECK(*reinterpret_cast<uint8_t*>(At(site)) == 0xE9, "jump written at %06X", unsigned(site));
+    int quad = 0;
+    for (int i = 0; i < 4; i++) quad += std::fabs(*Operand<float>(kQuadSites[i], 4)) == 50000.0f;
+    CHECK(quad == 4, "ambient shading quad widened to +-50000 (%d of 4)", quad);
+    double* xhair = Operand<double>(kCrosshairMul, 2);
+    double* scopeDiv = Operand<double>(kScopeDiv, 2);
+    CHECK(*xhair == 42.0 && *scopeDiv == 1280.0, "crosshair (%.1f) and scope (%.1f) constants redirected", *xhair,
+          *scopeDiv);
     double* basis = nullptr;
     int grass = 0;
     for (uintptr_t site : kGrass43) {
@@ -205,6 +223,7 @@ int main(int argc, char** argv) {
     WriteJmp(At(kModeAccept), &CatchAccept);
     WriteJmp(At(kModeReject), &CatchReject);
     WriteJmp(At(kRendererInit + 9), &CatchInit);
+    WriteJmp(At(kDropAspectEnd), &CatchX87);
 
     g_ren = static_cast<uint8_t*>(_aligned_malloc(0x20000, 16));
     g_cam = static_cast<uint8_t*>(_aligned_malloc(0x400, 16));
@@ -215,9 +234,9 @@ int main(int argc, char** argv) {
     printf("Renderer::SetViewport\n");
     auto setViewport = reinterpret_cast<SetViewportFn>(At(kSetViewport));
     struct { uint32_t w, h; float aspect, gui; bool wide; } vp[] = {
-        {3440, 1440, 1440.0f / 3440, 0.5625f, true}, {2560, 1080, 1080.0f / 2560, 0.5625f, true},
-        {1920, 1080, 0.5625f, 0.5625f, true},       {1920, 1200, 0.625f, 0.5625f, true},
-        {1280, 1024, 0.75f, 0.75f, false},          {1024, 768, 0.75f, 0.75f, false},
+        {3440, 1440, 1440.0f / 3440, 1440.0f / 3440, true}, {2560, 1080, 1080.0f / 2560, 1080.0f / 2560, true},
+        {1920, 1080, 0.5625f, 0.5625f, true},              {1920, 1200, 0.625f, 0.625f, true},
+        {1280, 1024, 0.75f, 0.75f, false},                 {1024, 768, 0.75f, 0.75f, false},
     };
     for (auto& v : vp) {
         setViewport(g_ren, 0, 0, v.w, v.h);
@@ -227,8 +246,32 @@ int main(int argc, char** argv) {
               g_ren[0x140ac]);
     }
 
-    printf("FOV blocks at 3440x1440\n");
+    printf("UI at 3440x1440\n");
     setViewport(g_ren, 0, 0, 3440, 1440);
+    CHECK(*scopeDiv == 1720.0, "scope overlay divisor %.1f (720 * 3440 / 1440 = 1720: same size per height as 16:9)",
+          *scopeDiv);
+    {
+        using SetPhysFn = void(__thiscall*)(void*, uint32_t, uint32_t, float);
+        auto setPhys = reinterpret_cast<SetPhysFn>(At(kSetPhysicalViewport));
+        uint8_t* gui = static_cast<uint8_t*>(_aligned_malloc(0x400, 16));
+        memset(gui, 0, 0x400);
+        struct { uint32_t w, h; float aspect; } ui[] = {
+            {3440, 1440, 1440.0f / 3440}, {1920, 1080, 0.5625f}, {1920, 1200, 0.625f}, {1024, 768, 0.75f}};
+        for (auto& u : ui) {
+            setPhys(gui, u.w, u.h, 0.0f);
+            float got = *reinterpret_cast<float*>(gui + 0x300);
+            CHECK(Near(got, u.aspect, 1e-5) && *reinterpret_cast<float*>(gui + 0x308) == 720.0f,
+                  "Gui::SetPhysicalViewport %ux%u: canvas h/w %.4f (want %.4f), height %.0f", u.w, u.h, got, u.aspect,
+                  *reinterpret_cast<float*>(gui + 0x308));
+        }
+    }
+    g_site = At(kDropAspect);
+    g_regEax = reinterpret_cast<uint32_t>(g_ren);
+    RunBlock(0.0f);
+    CHECK(g_x87Out == 0.5625f && g_catchEsp == g_saveEsp, "bullet-drop markers use 0.5625 on a wide screen (%.4f)",
+          g_x87Out);
+
+    printf("FOV blocks at 3440x1440\n");
     const double hw = 1440.0 / 3440;
     float aspect = 0;
     float cam = RunFovBlock(kCameraFov, float(60 * kDeg), &aspect);
@@ -261,6 +304,9 @@ int main(int argc, char** argv) {
     trg = RunFovBlock(kTriggerFov, float(60 * kDeg));
     CHECK(Near(eff / kDeg, HorPlus(75, hw)) && Near(trg / kDeg, HorPlus(75, hw)), "player %.2f / trigger %.2f deg follow",
           eff / kDeg, trg / kDeg);
+    CHECK(Near(*xhair, 42.0 / k, 1e-3), "crosshair scale %.2f (want 42 / %.3f = %.2f)", *xhair, k, 42.0 / k);
+    RunFovBlock(kEffectFov, float(15 * kDeg));
+    CHECK(*xhair == 42.0, "crosshair scale back to %.1f while scoped", *xhair);
     float huge = RunFovBlock(kCameraFov, float(170 * kDeg));
     CHECK(Near(huge / kDeg, 170.0), "170 widened past 175 is clamped: %.2f deg", huge / kDeg);
 
@@ -279,6 +325,10 @@ int main(int argc, char** argv) {
     CHECK(Near(cam / kDeg, 60.0, 1e-3) && Near(aspect, 0.75, 1e-6), "camera: 60 -> %.3f deg, aspect %.2f (unchanged)",
           cam / kDeg, aspect);
     CHECK(Near(*basis, 4.0 / 3.0, 1e-9), "grass basis back to 4/3");
+    g_site = At(kDropAspect);
+    g_regEax = reinterpret_cast<uint32_t>(g_ren);
+    RunBlock(0.0f);
+    CHECK(g_x87Out == 0.75f, "bullet-drop markers keep 0.75 (%.4f)", g_x87Out);
 
     printf("display mode filter\n");
     CHECK(RunMode(0, 3440, 1440, 144), "3440x1440@144 listed");

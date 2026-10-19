@@ -60,6 +60,9 @@ static void LoadConfig() {
     c.keyFovReset = IniInt("Camera", "KeyFOVReset", VK_MULTIPLY);
     c.fovStep = IniFloat("Camera", "FOVStep", 5.0f);
 
+    c.fixUI = IniInt("UI", "FixUI", 1) != 0;
+    c.crosshairFov = IniInt("UI", "CrosshairFOV", 1) != 0;
+
     c.log = IniInt("Debug", "Log", 1) != 0;
 }
 

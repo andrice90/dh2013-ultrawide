@@ -1,12 +1,16 @@
-// Engine patches for CloakNTEngine.dll (demo build): display mode whitelist, real aspect ratio, Hor+ FOV.
+// Engine patches for CloakNTEngine.dll (demo build): display mode whitelist, real aspect ratio, Hor+ FOV,
+// unstretched UI.
 //
-// How the engine handles the screen (see README "Engine notes"):
+// How the engine handles the screen (see README "How it works"):
 //  - Renderer::Init keeps only enumerated modes whose width, height and refresh are in fixed tables
 //    (widths up to 2560), so 3440x1440 is never offered and never runs.
 //  - Renderer::SetViewport computes h/w but stores 0.5625 (16:9) for anything wider than 3:2, else 0.75.
+//    Gui::SetPhysicalViewport rounds the same way, so menus and HUD are stretched on wider screens.
 //  - The FOV is a horizontal angle on a 4:3 basis. Camera::UpdateCachedData (projection),
 //    EffectManager::advanceTimeFov ("real fov") and ViewTrigger::IsInActiveRange (view cone) widen it for
 //    "widescreen" with a fixed 16:9 / 4:3 factor. The grass extents divide by 4/3 and the aspect value.
+//  - The deferred ambient passes shade through a fixed view-space quad (+-7000 at depth 3500), which only
+//    covers 2 * atan(2) = 126.9 degrees: wider views get unshaded (white) edges.
 #include "dh2013ws.h"
 #include <cmath>
 #include <cstring>
@@ -30,6 +34,18 @@ constexpr uintptr_t kTriggerFovEnd = 0x395f33;
 constexpr uintptr_t kGrass43[4] = {0x22b1e4, 0x22b8ac, 0x22c969, 0x22e9de};  // fdiv qword ptr [4/3]
 constexpr uintptr_t kConst43 = 0x6af018;        // double 4/3
 constexpr uintptr_t kDefaultFov = 0x8280ac;     // float: default player FOV (radians)
+// RenderShadeAmbient / RenderShadeAmbientDirectional: movss xmm0, [-7000] and movss xmm1, [7000]
+constexpr uintptr_t kQuadNeg[2] = {0x22fb43, 0x2303d3}, kQuadPos[2] = {0x22fb4b, 0x2303db};
+constexpr uintptr_t kQuadNegConst = 0x6b0d70, kQuadPosConst = 0x6b0d6c;
+constexpr uintptr_t kGuiAspect = 0x25c60d;      // Gui::SetPhysicalViewport: movss xmm0, [0.5625] (wide screens)
+constexpr uintptr_t kGuiAspectEnd = 0x25c61f;
+constexpr uintptr_t kConst169 = 0x6b1b5c;       // float 0.5625
+constexpr uintptr_t kCrosshairMul = 0x2dc44e;   // PlayerHud::Crosshair_AdvanceTime: fmul qword ptr [42.0]
+constexpr uintptr_t kConstCrosshair = 0x6b8590;
+constexpr uintptr_t kScopeDiv = 0x3bf4ff;       // wsModeHudBase::RenderHUD: fdiv qword ptr [1280.0] (wide)
+constexpr uintptr_t kConstScopeDiv = 0x6c73e8;
+constexpr uintptr_t kDropAspect = 0x3ba871;     // wsModeAimWeapon::ChangeDropMarkers: fld [eax+0x1409c]
+constexpr uintptr_t kDropAspectEnd = 0x3ba877;
 
 // Renderer fields
 constexpr size_t kModeCount = 0x12148;  // uint
@@ -38,6 +54,7 @@ constexpr uint32_t kModeSlots = 256;
 constexpr size_t kAspect = 0x1409c;     // float h/w used by the 3D view (snapped)
 constexpr size_t kAspectFull = 0x140a0; // float h/w of the full-screen viewport (snapped)
 constexpr size_t kWide = 0x140ac;       // bool: h/w < 0.666
+constexpr size_t kAspectGui = 0x140b0;  // float h/w used for GUI text and GUI 3D views (snapped)
 // Camera fields
 constexpr size_t kCamFov = 0xf8;        // float, radians
 
@@ -67,6 +84,11 @@ struct Expect {
 double g_refFov = 60.0 * kDeg;  // game default FOV (read from the engine at install)
 double g_k = 1.0;               // tan(user/2) / tan(ref/2): widening of the normal view
 double g_basis43 = 4.0 / 3.0;   // replaces the 4/3 constant in the grass extents: (4/3) / k
+double g_crosshairMul = 42.0;   // replaces 42.0 in the crosshair scale: 42 / widening of the current view
+double g_scopeDiv = 1280.0;     // replaces 1280 (16:9 canvas width) in the scope overlay size: 720 * w / h
+// Ambient shading quad: +-50000 at depth 3500 covers 2 * atan(50000 / 3500) = 172 degrees (FOV clamp is 170).
+float g_quadNeg = -50000.0f, g_quadPos = 50000.0f;
+float g_dropAspect = 0.5625f;   // bullet-drop markers keep the game's 16:9 maths (the vertical view is unchanged)
 
 void SetUserFov(float deg) {
     g_cfg.fov = deg;
@@ -139,6 +161,8 @@ float __stdcall EffectFov(float f, const uint8_t* r) {
         Log("default view renders %.1f degrees horizontal (aspect h/w %.4f)", normal / kDeg,
             r ? *reinterpret_cast<const float*>(r + kAspect) : 0.0f);
     }
+    // The crosshair is sized for the game's FOV; with a wider view the same spread covers less of the screen.
+    g_crosshairMul = g_cfg.crosshairFov ? 42.0 / FovScale(f) : 42.0;
     return RealFov(f, r);
 }
 
@@ -170,14 +194,21 @@ void __fastcall SetViewportHook(uint8_t* r, void*, uint32_t x, uint32_t y, uint3
     if (!w || !h) return;
     float real = static_cast<float>(h) / static_cast<float>(w);
     if (real < 0.666f) {  // the game stores 16:9 for anything wider than 3:2
-        *reinterpret_cast<float*>(r + kAspect) = real;
-        *reinterpret_cast<float*>(r + kAspectFull) = real;
+        if (g_cfg.fixAspect) {
+            *reinterpret_cast<float*>(r + kAspect) = real;
+            *reinterpret_cast<float*>(r + kAspectFull) = real;
+        }
+        if (g_cfg.fixUI) {
+            *reinterpret_cast<float*>(r + kAspectGui) = real;
+            g_scopeDiv = 720.0 * w / h;
+        }
     }
     static uint32_t lastW, lastH;
     if (w != lastW || h != lastH) {
         lastW = w;
         lastH = h;
-        Log("viewport %ux%u at %u,%u: 3D aspect h/w %.4f", w, h, x, y, *reinterpret_cast<float*>(r + kAspect));
+        Log("viewport %ux%u at %u,%u: 3D aspect h/w %.4f, UI h/w %.4f", w, h, x, y,
+            *reinterpret_cast<float*>(r + kAspect), *reinterpret_cast<float*>(r + kAspectGui));
     }
 }
 
@@ -211,7 +242,7 @@ uint32_t __fastcall InitHook(void* r, void*, uint32_t adapter, uint32_t b, uint3
 }
 
 // ---- naked stubs jumped to from the engine ----------------------------------------------------
-uintptr_t g_retModeAccept, g_retModeReject, g_retCamera, g_retEffect, g_retTrigger;
+uintptr_t g_retModeAccept, g_retModeReject, g_retCamera, g_retEffect, g_retTrigger, g_retGuiAspect, g_retDrop;
 float g_effectOut;
 
 // pushad keeps the integer registers; our C++ may use any xmm register, so keep those too.
@@ -286,11 +317,43 @@ __declspec(naked) void TriggerStub() {
     __asm jmp dword ptr[g_retTrigger]
 }
 
+// Gui::SetPhysicalViewport, wide screens: [ebp+8] = width, [ebp+0xc] = height (as floats); xmm0 = h/w
+// instead of 0.5625, so the 720-high UI canvas gets the screen's real width.
+__declspec(naked) void GuiAspectStub() {
+    __asm movss xmm0, dword ptr[ebp + 0xc]
+    __asm divss xmm0, dword ptr[ebp + 8]
+    __asm jmp dword ptr[g_retGuiAspect]
+}
+
+// wsModeAimWeapon::ChangeDropMarkers. eax = g_renderer; replaces fld [eax+0x1409c] with 0.5625 on wide screens.
+__declspec(naked) void DropStub() {
+    __asm fld dword ptr[eax + 0x1409c]
+    __asm cmp byte ptr[eax + 0x140ac], 0
+    __asm je done
+    __asm fstp st(0)
+    __asm fld dword ptr[g_dropAspect]
+done:
+    __asm jmp dword ptr[g_retDrop]
+}
+
 // Jumps from `site` to `stub`; the code up to the stub's return address is skipped.
 bool Reroute(const char* what, uintptr_t site, const Expect& e, void* stub) {
     bool ok = hook::Jump(At(site), stub, e.n, e.b);
     Log("%s: %s", what, ok ? "patched" : "NOT patched (unexpected code)");
     return ok;
+}
+
+// Points the memory operand of the instruction at `site` (`opcode` bytes, then the address of the engine
+// constant at `constRva`) at `repl` instead.
+bool Redirect(uintptr_t site, std::initializer_list<uint8_t> opcode, uintptr_t constRva, void* repl) {
+    Expect e;
+    e.Bytes(opcode).Addr(constRva);
+    if (std::memcmp(reinterpret_cast<void*>(At(site)), e.b, e.n) != 0) return false;
+    return hook::WritePtr(reinterpret_cast<void*>(At(site) + opcode.size()), repl);
+}
+
+bool BytesAt(uintptr_t rva, std::initializer_list<uint8_t> bytes) {
+    return std::memcmp(reinterpret_cast<void*>(At(rva)), bytes.begin(), bytes.size()) == 0;
 }
 
 }  // namespace
@@ -318,9 +381,9 @@ bool InstallPatches() {
     if (!(g_refFov > 0.1 && g_refFov < 3.0)) g_refFov = 60.0 * kDeg;
     SetUserFov(g_cfg.fov);
     Log("config: AllModes=%d MinRefresh=%d Width=%d Height=%d Refresh=%d FixAspect=%d FOV=%.1f (game default %.1f) "
-        "ZoomBlend=%.2f",
+        "ZoomBlend=%.2f FixUI=%d CrosshairFOV=%d",
         g_cfg.allModes, g_cfg.minRefresh, g_cfg.width, g_cfg.height, g_cfg.refresh, g_cfg.fixAspect, g_cfg.fov,
-        g_refFov / kDeg, g_cfg.zoomBlend);
+        g_refFov / kDeg, g_cfg.zoomBlend, g_cfg.fixUI, g_cfg.crosshairFov);
 
     if (g_cfg.allModes) {
         Expect e;
@@ -333,11 +396,35 @@ bool InstallPatches() {
         g_origInit = reinterpret_cast<InitFn>(hook::Detour(At(kRendererInit), &InitHook, sizeof pro, pro));
         Log("forced resolution: %s", g_origInit ? "hooked" : "NOT hooked");
     }
-    if (g_cfg.fixAspect) {
+    if (g_cfg.fixAspect || g_cfg.fixUI) {
         const uint8_t pro[] = {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x08};  // push ebp; mov ebp,esp; sub esp,8
         g_origSetViewport = reinterpret_cast<SetViewportFn>(hook::Detour(At(kSetViewport), &SetViewportHook, sizeof pro, pro));
         Log("real aspect ratio: %s", g_origSetViewport ? "hooked" : "NOT hooked");
     }
+    if (g_cfg.fixAspect && BytesAt(kDropAspectEnd, {0xD8, 0x4D, 0x08})) {  // fmul dword ptr [ebp+8]
+        g_retDrop = At(kDropAspectEnd);
+        Reroute("bullet-drop markers", kDropAspect, Expect().Bytes({0xD9, 0x80, 0x9C, 0x40, 0x01, 0x00}), &DropStub);
+    }
+    if (g_cfg.fixUI) {
+        if (BytesAt(kGuiAspectEnd, {0x8B, 0x91, 0xF8})) {  // mov edx, [ecx+0x2f8]
+            g_retGuiAspect = At(kGuiAspectEnd);
+            Expect e;
+            e.Bytes({0xF3, 0x0F, 0x10, 0x05}).Addr(kConst169);  // movss xmm0, [0.5625]
+            Reroute("UI aspect", kGuiAspect, e, &GuiAspectStub);
+        }
+        bool scope = Redirect(kScopeDiv, {0xDC, 0x35}, kConstScopeDiv, &g_scopeDiv);  // fdiv qword ptr [1280]
+        Log("scope overlay size: %s", scope ? "patched" : "NOT patched (unexpected code)");
+    }
+    if (g_cfg.crosshairFov) {
+        bool xhair = Redirect(kCrosshairMul, {0xDC, 0x0D}, kConstCrosshair, &g_crosshairMul);  // fmul qword ptr [42]
+        Log("crosshair FOV scaling: %s", xhair ? "patched" : "NOT patched (unexpected code)");
+    }
+    int quad = 0;
+    for (int i = 0; i < 2; i++) {
+        quad += Redirect(kQuadNeg[i], {0xF3, 0x0F, 0x10, 0x05}, kQuadNegConst, &g_quadNeg);  // movss xmm0, [-7000]
+        quad += Redirect(kQuadPos[i], {0xF3, 0x0F, 0x10, 0x0D}, kQuadPosConst, &g_quadPos);  // movss xmm1, [7000]
+    }
+    Log("ambient shading quad: %d of 4 patched", quad);
     Reroute("camera FOV", kCameraFov, Expect().Bytes({0x80, 0xB8, 0xAC, 0x40, 0x01, 0x00, 0x00}), &CameraStub);
     Reroute("player FOV", kEffectFov, Expect().Bytes({0x80, 0xBA, 0xAC, 0x40, 0x01, 0x00, 0x00}), &EffectStub);
     Reroute("view trigger FOV", kTriggerFov, Expect().Bytes({0x80, 0xB9, 0xAC, 0x40, 0x01, 0x00, 0x00}), &TriggerStub);

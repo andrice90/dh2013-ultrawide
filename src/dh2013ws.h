@@ -17,6 +17,9 @@ struct Config {
     float zoomBlend = 2.0f;  // zoom factor at which scopes/binoculars get their original magnification back
     int keyFovUp = VK_ADD, keyFovDown = VK_SUBTRACT, keyFovReset = VK_MULTIPLY;
     float fovStep = 5.0f;
+    // [UI]
+    bool fixUI = true;         // menus and HUD on a canvas with the real screen shape (not stretched)
+    bool crosshairFov = true;  // crosshair shrinks with the FOV setting so it covers the same spread
     // [Debug]
     bool log = true;
 };
