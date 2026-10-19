@@ -304,9 +304,22 @@ int main(int argc, char** argv) {
     trg = RunFovBlock(kTriggerFov, float(60 * kDeg));
     CHECK(Near(eff / kDeg, HorPlus(75, hw)) && Near(trg / kDeg, HorPlus(75, hw)), "player %.2f / trigger %.2f deg follow",
           eff / kDeg, trg / kDeg);
-    CHECK(Near(*xhair, 42.0 / k, 1e-3), "crosshair scale %.2f (want 42 / %.3f = %.2f)", *xhair, k, 42.0 / k);
+    CHECK(*xhair == 42.0, "crosshair stays at the game's size %.1f (CrosshairMinScale=1)", *xhair);
+    auto setXhairMin = reinterpret_cast<SetFovFn>(GetProcAddress(mod, "dh2013ws_test_crosshairmin"));
+    if (setXhairMin) setXhairMin(0.5f);
+    RunFovBlock(kEffectFov, float(60 * kDeg));
+    CHECK(Near(*xhair, 42.0 / k, 1e-3), "min 0.5: crosshair scale %.2f (want 42 / %.3f = %.2f)", *xhair, k, 42.0 / k);
+    if (setXhairMin) setXhairMin(0.9f);
+    RunFovBlock(kEffectFov, float(60 * kDeg));
+    CHECK(Near(*xhair, 42.0 * 0.9, 1e-4), "min 0.9: crosshair scale %.2f (want %.2f)", *xhair, 42.0 * 0.9);
     RunFovBlock(kEffectFov, float(15 * kDeg));
     CHECK(*xhair == 42.0, "crosshair scale back to %.1f while scoped", *xhair);
+    if (setXhairMin) setXhairMin(1.0f);
+    if (setFov) setFov(50.0f);
+    RunFovBlock(kEffectFov, float(60 * kDeg));
+    const double k50 = std::tan(25 * kDeg) / std::tan(30 * kDeg);
+    CHECK(Near(*xhair, 42.0 / k50, 1e-3), "FOV 50: crosshair grows to %.2f (want %.2f)", *xhair, 42.0 / k50);
+    if (setFov) setFov(75.0f);
     float huge = RunFovBlock(kCameraFov, float(170 * kDeg));
     CHECK(Near(huge / kDeg, 170.0), "170 widened past 175 is clamped: %.2f deg", huge / kDeg);
 

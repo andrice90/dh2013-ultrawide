@@ -62,6 +62,8 @@ static void LoadConfig() {
 
     c.fixUI = IniInt("UI", "FixUI", 1) != 0;
     c.crosshairFov = IniInt("UI", "CrosshairFOV", 1) != 0;
+    c.crosshairMinScale = IniFloat("UI", "CrosshairMinScale", 1.0f);
+    if (c.crosshairMinScale < 0.1f) c.crosshairMinScale = 0.1f;
 
     c.log = IniInt("Debug", "Log", 1) != 0;
 }

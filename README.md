@@ -39,7 +39,8 @@ Remove: delete `dinput8.dll` (and `dh2013ws.ini`, `dh2013ws.log`). No game file 
   binoculars are back to their original magnification. `KeyFOVUp/Down/Reset`, `FOVStep` — live hotkeys
   (virtual-key codes); changes are written back to `FOV=`.
 - `[UI] FixUI` — UI canvas with the real screen shape (0 = stretched 16:9 layout). `CrosshairFOV` — scale the
-  crosshair with the FOV setting.
+  crosshair with the FOV setting. `CrosshairMinScale` — smallest crosshair as a fraction of the game's own
+  (default 1.0: never smaller, so it only grows for FOV < 60; 0.86 keeps rifle/shotgun arms apart).
 - `[Proxy] Chain` — load another `dinput8.dll` instead of the system one.
 
 ## How it works
@@ -81,8 +82,10 @@ them). RVAs below are from base 0x10000000.
   which also rounds to 16:9 (1280 wide). The layout XML anchors elements (`c,c`, `0%r,-132b`, percent sizes),
   so the stub at `0x25c60d` gives it the real h/w (1720 wide at 3440x1440) and everything keeps its proportions.
   Text width uses `Renderer+0x140b0`, set to the same value.
-- **Crosshair**: `PlayerHud::Crosshair_AdvanceTime` scales the crosshair area by `PlayerHud+0x308` (script
-  spread value) × 2 × 42 (`fmul` at `0x2dc44e`). The operand points at `42 / widening of the current view`.
+- **Crosshair**: `PlayerHud::Crosshair_AdvanceTime` sizes the crosshair box as `PlayerHud+0x308` × 2 × 42
+  (`fmul` at `0x2dc44e`); `+0x308` is 1.0 and no script changes it, so the box is always 84 units. The arms
+  sit on its edges (`gui\hud\hud_crosshair.xml`: rifle/shotgun 36 long, pistol 42, so the pistol arms meet in
+  the middle). The operand points at `42 × max(1 / widening of the current view, CrosshairMinScale)`.
 - **Scope overlay**: `wsModeHudBase::RenderHUD` sizes it as `width × 1024 / 1280` on wide screens (`fdiv` at
   `0x3bf4ff`); the divisor becomes `720 × width / height`, i.e. the same size per screen height as at 16:9.
 - **Bullet-drop markers**: `wsModeAimWeapon::ChangeDropMarkers` divides by `3D aspect × scope FOV`; the stub at

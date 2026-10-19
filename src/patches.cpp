@@ -162,7 +162,11 @@ float __stdcall EffectFov(float f, const uint8_t* r) {
             r ? *reinterpret_cast<const float*>(r + kAspect) : 0.0f);
     }
     // The crosshair is sized for the game's FOV; with a wider view the same spread covers less of the screen.
-    g_crosshairMul = g_cfg.crosshairFov ? 42.0 / FovScale(f) : 42.0;
+    // Its arms sit at the edges of an 84-unit box (pistol arms are 42 long), so it never goes below
+    // CrosshairMinScale of the game's size.
+    double scale = 1.0 / FovScale(f);
+    if (scale < g_cfg.crosshairMinScale) scale = g_cfg.crosshairMinScale;
+    g_crosshairMul = g_cfg.crosshairFov ? 42.0 * scale : 42.0;
     return RealFov(f, r);
 }
 
@@ -381,9 +385,9 @@ bool InstallPatches() {
     if (!(g_refFov > 0.1 && g_refFov < 3.0)) g_refFov = 60.0 * kDeg;
     SetUserFov(g_cfg.fov);
     Log("config: AllModes=%d MinRefresh=%d Width=%d Height=%d Refresh=%d FixAspect=%d FOV=%.1f (game default %.1f) "
-        "ZoomBlend=%.2f FixUI=%d CrosshairFOV=%d",
+        "ZoomBlend=%.2f FixUI=%d CrosshairFOV=%d CrosshairMinScale=%.2f",
         g_cfg.allModes, g_cfg.minRefresh, g_cfg.width, g_cfg.height, g_cfg.refresh, g_cfg.fixAspect, g_cfg.fov,
-        g_refFov / kDeg, g_cfg.zoomBlend, g_cfg.fixUI, g_cfg.crosshairFov);
+        g_refFov / kDeg, g_cfg.zoomBlend, g_cfg.fixUI, g_cfg.crosshairFov, g_cfg.crosshairMinScale);
 
     if (g_cfg.allModes) {
         Expect e;
@@ -444,4 +448,5 @@ bool InstallPatches() {
 #ifdef DH2013WS_TEST
 extern "C" __declspec(dllexport) void dh2013ws_test_setfov(float deg) { SetUserFov(deg); }
 extern "C" __declspec(dllexport) void dh2013ws_test_zoomblend(float z) { g_cfg.zoomBlend = z; }
+extern "C" __declspec(dllexport) void dh2013ws_test_crosshairmin(float s) { g_cfg.crosshairMinScale = s; }
 #endif

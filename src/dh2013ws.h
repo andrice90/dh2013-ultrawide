@@ -20,6 +20,7 @@ struct Config {
     // [UI]
     bool fixUI = true;         // menus and HUD on a canvas with the real screen shape (not stretched)
     bool crosshairFov = true;  // crosshair shrinks with the FOV setting so it covers the same spread
+    float crosshairMinScale = 1.0f;  // smallest crosshair, as a fraction of the game's size
     // [Debug]
     bool log = true;
 };
