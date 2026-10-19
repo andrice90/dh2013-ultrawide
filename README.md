@@ -1,4 +1,4 @@
-# Cabela's Dangerous Hunts 2013 Widescreen Fix
+# Cabela's Dangerous Hunts 2013 Widescreen Fix + Adjustable FOV
 
 Ultrawide and widescreen support for **Cabela's Dangerous Hunts 2013** on PC: any resolution your monitor
 supports, the correct aspect ratio, an adjustable field of view and an unstretched HUD.
