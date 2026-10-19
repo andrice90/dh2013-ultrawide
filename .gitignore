@@ -1,0 +1,4 @@
+build/
+re/*.txt
+*.log
+__pycache__/
