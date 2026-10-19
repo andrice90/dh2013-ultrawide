@@ -1,0 +1,37 @@
+# Builds dinput8.dll on every push and pull request, and attaches the player zip to a GitHub release when a
+# tag like v1.2.0 is pushed. (The offline tests need the game's CloakNTEngine.dll, so they run locally:
+# .\test.ps1.)
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and package
+        shell: pwsh
+        run: ./package.ps1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dh2013ws
+          path: dist/*.zip
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = (Get-ChildItem dist/*.zip).FullName
+          gh release create $env:GITHUB_REF_NAME $zip --title "dh2013ws $env:GITHUB_REF_NAME" --notes-file dist/release-notes.md

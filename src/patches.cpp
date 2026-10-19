@@ -1,7 +1,6 @@
-// Engine patches for CloakNTEngine.dll (demo build): display mode whitelist, real aspect ratio, Hor+ FOV,
-// unstretched UI.
+// Engine patches for CloakNTEngine.dll: display mode whitelist, real aspect ratio, Hor+ FOV, unstretched UI.
 //
-// How the engine handles the screen (see README "How it works"):
+// How the engine handles the screen (docs/engine-notes.md has the details):
 //  - Renderer::Init keeps only enumerated modes whose width, height and refresh are in fixed tables
 //    (widths up to 2560), so 3440x1440 is never offered and never runs.
 //  - Renderer::SetViewport computes h/w but stores 0.5625 (16:9) for anything wider than 3:2, else 0.75.
@@ -11,74 +10,122 @@
 //    "widescreen" with a fixed 16:9 / 4:3 factor. The grass extents divide by 4/3 and the aspect value.
 //  - The deferred ambient passes shade through a fixed view-space quad (+-7000 at depth 3500), which only
 //    covers 2 * atan(2) = 126.9 degrees: wider views get unshaded (white) edges.
+//
+// Nothing here uses fixed addresses. Each patch site is found inside an exported engine function (the engine
+// exports ~17,000 C++ names) by a byte pattern, and constants are recognised by their values; struct field
+// offsets come from small exported getters. A build of the engine where a pattern no longer matches loses
+// only that patch (the log says which). Worked out on the Steam demo; the full game uses the same engine.
 #include "dh2013ws.h"
 #include <cmath>
 #include <cstring>
-#include <initializer_list>
 
 namespace {
-
-// ---- CloakNTEngine.dll RVAs (preferred base 0x10000000) -----------------------------------------
-constexpr uintptr_t kRendererInit = 0x256780;   // bool Renderer::Init(uint, bool, uint w, uint h, uint hz, bool, bool)
-constexpr uintptr_t kModeFilter = 0x256885;     // Init: whitelist test of the mode just enumerated
-constexpr uintptr_t kModeAccept = 0x2568a3;     //   -> count++
-constexpr uintptr_t kModeReject = 0x2568b0;     //   -> next mode
-constexpr uintptr_t kWidthTable = 0x6b13f8, kHeightTable = 0x6b1428, kRefreshTable = 0x6b146c;
-constexpr uintptr_t kSetViewport = 0x255140;    // void Renderer::SetViewport(uint x, uint y, uint w, uint h)
-constexpr uintptr_t kCameraFov = 0x31056d;      // Camera::UpdateCachedData: widen fov, load aspect
-constexpr uintptr_t kCameraFovEnd = 0x3105cc;   //   -> mtProjection(fov=[ebp-4], aspect=[ebp-0xc], ...)
-constexpr uintptr_t kEffectFov = 0x1eaefe;      // EffectManager::advanceTimeFov: widen fov -> xmm0
-constexpr uintptr_t kEffectFovEnd = 0x1eaf48;   //   -> movss [edi+0xa8], xmm0
-constexpr uintptr_t kTriggerFov = 0x395eee;     // ViewTrigger::IsInActiveRange: widen [ebp+8]
-constexpr uintptr_t kTriggerFovEnd = 0x395f33;
-constexpr uintptr_t kGrass43[4] = {0x22b1e4, 0x22b8ac, 0x22c969, 0x22e9de};  // fdiv qword ptr [4/3]
-constexpr uintptr_t kConst43 = 0x6af018;        // double 4/3
-constexpr uintptr_t kDefaultFov = 0x8280ac;     // float: default player FOV (radians)
-// RenderShadeAmbient / RenderShadeAmbientDirectional: movss xmm0, [-7000] and movss xmm1, [7000]
-constexpr uintptr_t kQuadNeg[2] = {0x22fb43, 0x2303d3}, kQuadPos[2] = {0x22fb4b, 0x2303db};
-constexpr uintptr_t kQuadNegConst = 0x6b0d70, kQuadPosConst = 0x6b0d6c;
-constexpr uintptr_t kGuiAspect = 0x25c60d;      // Gui::SetPhysicalViewport: movss xmm0, [0.5625] (wide screens)
-constexpr uintptr_t kGuiAspectEnd = 0x25c61f;
-constexpr uintptr_t kConst169 = 0x6b1b5c;       // float 0.5625
-constexpr uintptr_t kCrosshairMul = 0x2dc44e;   // PlayerHud::Crosshair_AdvanceTime: fmul qword ptr [42.0]
-constexpr uintptr_t kConstCrosshair = 0x6b8590;
-constexpr uintptr_t kScopeDiv = 0x3bf4ff;       // wsModeHudBase::RenderHUD: fdiv qword ptr [1280.0] (wide)
-constexpr uintptr_t kConstScopeDiv = 0x6c73e8;
-constexpr uintptr_t kDropAspect = 0x3ba871;     // wsModeAimWeapon::ChangeDropMarkers: fld [eax+0x1409c]
-constexpr uintptr_t kDropAspectEnd = 0x3ba877;
-
-// Renderer fields
-constexpr size_t kModeCount = 0x12148;  // uint
-constexpr size_t kModes = 0x1214c;      // D3DDISPLAYMODE[256] (Width, Height, RefreshRate, Format)
-constexpr uint32_t kModeSlots = 256;
-constexpr size_t kAspect = 0x1409c;     // float h/w used by the 3D view (snapped)
-constexpr size_t kAspectFull = 0x140a0; // float h/w of the full-screen viewport (snapped)
-constexpr size_t kWide = 0x140ac;       // bool: h/w < 0.666
-constexpr size_t kAspectGui = 0x140b0;  // float h/w used for GUI text and GUI 3D views (snapped)
-// Camera fields
-constexpr size_t kCamFov = 0xf8;        // float, radians
 
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kDeg = kPi / 180.0;
 constexpr double kMaxFov = 170.0 * kDeg;
+constexpr uint32_t kModeSlots = 256;  // Renderer's D3DDISPLAYMODE array
 
-uintptr_t At(uintptr_t rva) { return g_engine + rva; }
+// ---- reading the engine -------------------------------------------------------------------------
+size_t g_imageSize;
 
-// Builds expected code bytes; `rvas` lists absolute addresses (relocated with the module) at byte offsets.
-struct Expect {
-    uint8_t b[64];
-    size_t n = 0;
-    Expect& Bytes(std::initializer_list<uint8_t> list) {
-        for (uint8_t x : list) b[n++] = x;
-        return *this;
+bool InImage(uintptr_t a, size_t n) { return a >= g_engine && a + n <= g_engine + g_imageSize; }
+uint32_t U32(uintptr_t a) { return *reinterpret_cast<const uint32_t*>(a); }
+int8_t S8(uintptr_t a) { return *reinterpret_cast<const int8_t*>(a); }
+// Value of the float / double an absolute memory operand at `a` points to (NaN if it is outside the image).
+double F32At(uintptr_t a) { uintptr_t p = U32(a); return InImage(p, 4) ? *reinterpret_cast<const float*>(p) : NAN; }
+double F64At(uintptr_t a) { uintptr_t p = U32(a); return InImage(p, 8) ? *reinterpret_cast<const double*>(p) : NAN; }
+bool Same(double a, double b) { return std::fabs(a - b) <= 1e-6 * std::fabs(b); }
+
+uintptr_t Export(const char* name) {
+    uintptr_t a = reinterpret_cast<uintptr_t>(GetProcAddress(reinterpret_cast<HMODULE>(g_engine), name));
+    if (!a) Log("export %s not found", name);
+    return a;
+}
+
+// Bytes from `f` to the next exported address (an upper bound for the function's length), at most `max`.
+// Keeps pattern searches inside one function.
+size_t Span(uintptr_t f, size_t max) {
+    if (!f) return 0;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(g_engine + reinterpret_cast<IMAGE_DOS_HEADER*>(g_engine)->e_lfanew);
+    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    auto* exp = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(g_engine + dir.VirtualAddress);
+    auto* funcs = reinterpret_cast<const uint32_t*>(g_engine + exp->AddressOfFunctions);
+    size_t len = max;
+    for (DWORD i = 0; i < exp->NumberOfFunctions; i++) {
+        uintptr_t a = g_engine + funcs[i];
+        if (a > f && a - f < len) len = a - f;
     }
-    Expect& Addr(uintptr_t rva) {
-        uint32_t v = static_cast<uint32_t>(At(rva));
-        std::memcpy(b + n, &v, 4);
-        n += 4;
-        return *this;
+    return len;
+}
+
+// Byte pattern with "??" wildcards, e.g. "80 B8 ?? ?? ?? ?? 00 74 ??".
+struct Pattern {
+    uint8_t b[64];
+    bool any[64];
+    size_t n = 0;
+    static int Nibble(char c) { return c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10; }
+    explicit Pattern(const char* s) {
+        while (s[0] && s[1] && n < 64) {
+            if (s[0] == ' ') { s++; continue; }
+            any[n] = s[0] == '?';
+            b[n] = any[n] ? 0 : static_cast<uint8_t>(Nibble(s[0]) << 4 | Nibble(s[1]));
+            n++;
+            s += 2;
+        }
+    }
+    bool At(uintptr_t a) const {
+        if (!InImage(a, n)) return false;
+        const auto* p = reinterpret_cast<const uint8_t*>(a);
+        for (size_t i = 0; i < n; i++)
+            if (!any[i] && p[i] != b[i]) return false;
+        return true;
     }
 };
+
+// Calls `accept(match)` for every match of `pattern` in the function at `start`, at most `len` bytes in;
+// returns the matches accepted.
+template <typename F>
+int Scan(uintptr_t start, size_t len, const Pattern& p, F accept, uintptr_t* first = nullptr) {
+    int count = 0;
+    if (!start) return 0;
+    len = Span(start, len);
+    for (uintptr_t a = start; a < start + len; a++) {
+        if (p.At(a) && accept(a)) {
+            if (!count && first) *first = a;
+            count++;
+        }
+    }
+    return count;
+}
+// The single match (0 if there is none or more than one).
+uintptr_t FindOne(uintptr_t start, size_t len, const Pattern& p, bool (*accept)(uintptr_t) = nullptr) {
+    uintptr_t hit = 0;
+    int n = Scan(start, len, p, [&](uintptr_t a) { return !accept || accept(a); }, &hit);
+    return n == 1 ? hit : 0;
+}
+bool Contains(uintptr_t start, size_t len, const Pattern& p) {
+    return Scan(start, len, p, [](uintptr_t) { return true; }) > 0;
+}
+
+// Named addresses found at startup (logged, and read by the offline tests).
+struct Note {
+    const char* name;
+    uintptr_t value;
+};
+Note g_notes[64];
+int g_noteCount;
+uintptr_t Noted(const char* name, uintptr_t value) {
+    if (g_noteCount < 64) g_notes[g_noteCount++] = {name, value};
+    return value;
+}
+
+// ---- engine layout, resolved at startup -----------------------------------------------------------
+uint32_t g_offAspect, g_offAspectFull, g_offWide, g_offAspectGui;  // Renderer fields
+uint32_t g_offModeCount, g_offModes;                                // Renderer display mode list
+uint32_t g_offCamFov;                                               // Camera field (radians)
+
+float RF(const uint8_t* r, uint32_t off) { return *reinterpret_cast<const float*>(r + off); }
 
 // ---- field of view --------------------------------------------------------------------------
 double g_refFov = 60.0 * kDeg;  // game default FOV (read from the engine at install)
@@ -112,8 +159,8 @@ double FovScale(double f) {
 float RealFov(float f, const uint8_t* r) {
     if (!(f > 0.0f && f < kPi)) return f;
     double t = std::tan(f * 0.5);
-    if (r && r[kWide]) {
-        float aspect = *reinterpret_cast<const float*>(r + kAspect);  // h/w
+    if (r && r[g_offWide]) {
+        float aspect = RF(r, g_offAspect);  // h/w
         if (aspect > 0.0f) t *= (1.0 / aspect) / (4.0 / 3.0);
     }
     t *= FovScale(f);
@@ -147,8 +194,8 @@ void PollFovKeys() {
 
 // ---- called from the patched engine code ----------------------------------------------------
 void __stdcall CameraFov(const uint8_t* cam, const uint8_t* r, float* fovOut, float* aspectOut) {
-    *fovOut = RealFov(*reinterpret_cast<const float*>(cam + kCamFov), r);
-    *aspectOut = *reinterpret_cast<const float*>(r + kAspect);
+    *fovOut = RealFov(RF(cam, g_offCamFov), r);
+    *aspectOut = RF(r, g_offAspect);
 }
 
 float __stdcall EffectFov(float f, const uint8_t* r) {
@@ -158,8 +205,7 @@ float __stdcall EffectFov(float f, const uint8_t* r) {
     float normal = RealFov(static_cast<float>(g_refFov), r);
     if (std::fabs(normal - lastNormal) > 0.001f) {
         lastNormal = normal;
-        Log("default view renders %.1f degrees horizontal (aspect h/w %.4f)", normal / kDeg,
-            r ? *reinterpret_cast<const float*>(r + kAspect) : 0.0f);
+        Log("default view renders %.1f degrees horizontal (aspect h/w %.4f)", normal / kDeg, r ? RF(r, g_offAspect) : 0.0f);
     }
     // The crosshair is sized for the game's FOV; with a wider view the same spread covers less of the screen.
     // Its arms sit at the edges of an 84-unit box (pistol arms are 42 long), so it never goes below
@@ -173,8 +219,8 @@ float __stdcall EffectFov(float f, const uint8_t* r) {
 float __stdcall TriggerFov(float f, const uint8_t* r) { return RealFov(f, r); }
 
 bool __stdcall AcceptMode(const uint8_t* r) {
-    uint32_t count = *reinterpret_cast<const uint32_t*>(r + kModeCount);
-    const uint32_t* m = reinterpret_cast<const uint32_t*>(r + kModes + count * 16);
+    uint32_t count = *reinterpret_cast<const uint32_t*>(r + g_offModeCount);
+    const uint32_t* m = reinterpret_cast<const uint32_t*>(r + g_offModes + count * 16);
     uint32_t w = m[0], h = m[1], hz = m[2];
     // The next mode is enumerated into slot `count`, so keep one slot free.
     if (count + 2 > kModeSlots) return false;
@@ -182,7 +228,7 @@ bool __stdcall AcceptMode(const uint8_t* r) {
     if (w < 800 || h < 600 || w > 4095 || h > 4095) return false;
     if (hz < static_cast<uint32_t>(g_cfg.minRefresh) || hz > 255) return false;
     for (uint32_t i = 0; i < count; i++) {
-        const uint32_t* o = reinterpret_cast<const uint32_t*>(r + kModes + i * 16);
+        const uint32_t* o = reinterpret_cast<const uint32_t*>(r + g_offModes + i * 16);
         if (o[0] == w && o[1] == h && o[2] == hz) return false;
     }
     Log("mode %ux%u@%u listed", w, h, hz);
@@ -199,11 +245,11 @@ void __fastcall SetViewportHook(uint8_t* r, void*, uint32_t x, uint32_t y, uint3
     float real = static_cast<float>(h) / static_cast<float>(w);
     if (real < 0.666f) {  // the game stores 16:9 for anything wider than 3:2
         if (g_cfg.fixAspect) {
-            *reinterpret_cast<float*>(r + kAspect) = real;
-            *reinterpret_cast<float*>(r + kAspectFull) = real;
+            *reinterpret_cast<float*>(r + g_offAspect) = real;
+            *reinterpret_cast<float*>(r + g_offAspectFull) = real;
         }
         if (g_cfg.fixUI) {
-            *reinterpret_cast<float*>(r + kAspectGui) = real;
+            *reinterpret_cast<float*>(r + g_offAspectGui) = real;
             g_scopeDiv = 720.0 * w / h;
         }
     }
@@ -211,8 +257,8 @@ void __fastcall SetViewportHook(uint8_t* r, void*, uint32_t x, uint32_t y, uint3
     if (w != lastW || h != lastH) {
         lastW = w;
         lastH = h;
-        Log("viewport %ux%u at %u,%u: 3D aspect h/w %.4f, UI h/w %.4f", w, h, x, y,
-            *reinterpret_cast<float*>(r + kAspect), *reinterpret_cast<float*>(r + kAspectGui));
+        Log("viewport %ux%u at %u,%u: 3D aspect h/w %.4f, UI h/w %.4f", w, h, x, y, RF(r, g_offAspect),
+            RF(r, g_offAspectGui));
     }
 }
 
@@ -329,10 +375,14 @@ __declspec(naked) void GuiAspectStub() {
     __asm jmp dword ptr[g_retGuiAspect]
 }
 
-// wsModeAimWeapon::ChangeDropMarkers. eax = g_renderer; replaces fld [eax+0x1409c] with 0.5625 on wide screens.
+// wsModeAimWeapon::ChangeDropMarkers. eax = g_renderer; replaces fld [eax+aspect] with 0.5625 on wide screens.
 __declspec(naked) void DropStub() {
-    __asm fld dword ptr[eax + 0x1409c]
-    __asm cmp byte ptr[eax + 0x140ac], 0
+    __asm push ecx
+    __asm mov ecx, dword ptr[g_offAspect]
+    __asm fld dword ptr[eax + ecx]
+    __asm mov ecx, dword ptr[g_offWide]
+    __asm cmp byte ptr[eax + ecx], 0
+    __asm pop ecx
     __asm je done
     __asm fstp st(0)
     __asm fld dword ptr[g_dropAspect]
@@ -340,106 +390,195 @@ done:
     __asm jmp dword ptr[g_retDrop]
 }
 
-// Jumps from `site` to `stub`; the code up to the stub's return address is skipped.
-bool Reroute(const char* what, uintptr_t site, const Expect& e, void* stub) {
-    bool ok = hook::Jump(At(site), stub, e.n, e.b);
-    Log("%s: %s", what, ok ? "patched" : "NOT patched (unexpected code)");
+// ---- finding the patch sites ------------------------------------------------------------------
+// Struct offset read by a getter `fld/mov reg, [ecx+disp32]; ret`.
+uint32_t GetterOffset(const char* name, const char* pattern) {
+    uintptr_t f = Export(name);
+    return f && Pattern(pattern).At(f) ? U32(f + 2) : 0;
+}
+
+bool ResolveLayout() {
+    g_offAspect = GetterOffset("?GetGameAspectRatio@Renderer@@QAEMXZ", "D9 81 ?? ?? ?? ?? C3");
+    g_offWide = GetterOffset("?GetGameWideScreen@Renderer@@QAE_NXZ", "8A 81 ?? ?? ?? ?? C3");
+    g_offAspectGui = GetterOffset("?GetAspectRatio@Renderer@@QAEMXZ", "D9 81 ?? ?? ?? ?? C3");
+    g_offCamFov = GetterOffset("?GetFov@Camera@@QAEMXZ", "D9 81 ?? ?? ?? ?? C3");
+    // BeginRenderingFullScreen copies the full-screen aspect into the 3D one: fld [ecx+full]; fstp [ecx+aspect]
+    uintptr_t full = 0;
+    Scan(Export("?BeginRenderingFullScreen@Renderer@@QAEXXZ"), 0x40, Pattern("D9 81 ?? ?? ?? ?? D9 99 ?? ?? ?? ??"),
+         [](uintptr_t a) { return U32(a + 8) == g_offAspect; }, &full);
+    g_offAspectFull = full ? U32(full + 2) : 0;
+    Log("renderer layout: aspect +%X, full-screen aspect +%X, widescreen flag +%X, UI aspect +%X; camera FOV +%X",
+        g_offAspect, g_offAspectFull, g_offWide, g_offAspectGui, g_offCamFov);
+    Noted("off.aspect", g_offAspect), Noted("off.aspectFull", g_offAspectFull), Noted("off.wide", g_offWide);
+    Noted("off.aspectGui", g_offAspectGui), Noted("off.camFov", g_offCamFov);
+    return g_offAspect && g_offAspectFull && g_offWide && g_offAspectGui && g_offCamFov;
+}
+
+// A widening block "cmp byte ptr [reg+wide], 0; je end" (plus `tail` bytes) inside `func`. Returns the
+// block start and sets `end` to the je target.
+uintptr_t WideBlock(const char* func, size_t window, const char* pattern, size_t jePos, uintptr_t* end) {
+    uintptr_t f = Export(func);
+    uintptr_t site = FindOne(f, window, Pattern(pattern), [](uintptr_t a) { return U32(a + 2) == g_offWide; });
+    if (site) *end = site + jePos + 2 + S8(site + jePos + 1);
+    return site;
+}
+
+bool Report(const char* what, bool ok) {
+    Log("%s: %s", what, ok ? "patched" : "NOT patched (code not recognised)");
     return ok;
 }
 
-// Points the memory operand of the instruction at `site` (`opcode` bytes, then the address of the engine
-// constant at `constRva`) at `repl` instead.
-bool Redirect(uintptr_t site, std::initializer_list<uint8_t> opcode, uintptr_t constRva, void* repl) {
-    Expect e;
-    e.Bytes(opcode).Addr(constRva);
-    if (std::memcmp(reinterpret_cast<void*>(At(site)), e.b, e.n) != 0) return false;
-    return hook::WritePtr(reinterpret_cast<void*>(At(site) + opcode.size()), repl);
-}
-
-bool BytesAt(uintptr_t rva, std::initializer_list<uint8_t> bytes) {
-    return std::memcmp(reinterpret_cast<void*>(At(rva)), bytes.begin(), bytes.size()) == 0;
+bool Jump(uintptr_t site, size_t len, void* stub) {
+    return site && hook::Jump(site, stub, len, reinterpret_cast<const uint8_t*>(site));
 }
 
 }  // namespace
 
 bool InstallPatches() {
-    // `cmp byte ptr [reg+0x140ac], 0` opens each widening block; the bytes where the stubs return are checked too.
-    const uint8_t retCamera[] = {0xD9, 0x86, 0x04};  // fld dword ptr [esi+0x104]
-    const uint8_t retEffect[] = {0xF3, 0x0F, 0x11};  // movss [edi+0xa8], xmm0
-    const uint8_t retTrigger[] = {0xD9, 0x45, 0xFC}; // fld dword ptr [ebp-4]
-    const uint8_t retAccept[] = {0x8B, 0x86, 0x48};  // mov eax, [esi+0x12148]
-    if (std::memcmp(reinterpret_cast<void*>(At(kCameraFovEnd)), retCamera, 3) ||
-        std::memcmp(reinterpret_cast<void*>(At(kEffectFovEnd)), retEffect, 3) ||
-        std::memcmp(reinterpret_cast<void*>(At(kTriggerFovEnd)), retTrigger, 3) ||
-        std::memcmp(reinterpret_cast<void*>(At(kModeAccept)), retAccept, 3)) {
-        Log("unexpected engine code: mod disabled");
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(g_engine);
+    g_imageSize = reinterpret_cast<IMAGE_NT_HEADERS32*>(g_engine + dos->e_lfanew)->OptionalHeader.SizeOfImage;
+    if (!ResolveLayout()) {
+        Log("engine layout not recognised: mod disabled");
         return false;
     }
-    g_retModeAccept = At(kModeAccept);
-    g_retModeReject = At(kModeReject);
-    g_retCamera = At(kCameraFovEnd);
-    g_retEffect = At(kEffectFovEnd);
-    g_retTrigger = At(kTriggerFovEnd);
 
-    g_refFov = *reinterpret_cast<const float*>(At(kDefaultFov));
-    if (!(g_refFov > 0.1 && g_refFov < 3.0)) g_refFov = 60.0 * kDeg;
+    // Default player FOV: EffectManager::advanceTimeFov starts with movss xmm0, [default].
+    uintptr_t fovFunc = Export("?advanceTimeFov@EffectManager@@QAEXMPAVActor@@PAVcsControllerActorPlayer@@@Z");
+    uintptr_t fovLoad = FindOne(fovFunc, 0x20, Pattern("F3 0F 10 05 ?? ?? ?? ??"));
+    double ref = fovLoad ? F32At(fovLoad + 4) : NAN;
+    g_refFov = ref > 0.1 && ref < 3.0 ? ref : 60.0 * kDeg;
     SetUserFov(g_cfg.fov);
     Log("config: AllModes=%d MinRefresh=%d Width=%d Height=%d Refresh=%d FixAspect=%d FOV=%.1f (game default %.1f) "
         "ZoomBlend=%.2f FixUI=%d CrosshairFOV=%d CrosshairMinScale=%.2f",
         g_cfg.allModes, g_cfg.minRefresh, g_cfg.width, g_cfg.height, g_cfg.refresh, g_cfg.fixAspect, g_cfg.fov,
         g_refFov / kDeg, g_cfg.zoomBlend, g_cfg.fixUI, g_cfg.crosshairFov, g_cfg.crosshairMinScale);
 
+    // Display modes: Renderer::Init tests each enumerated mode against three tables:
+    //   cmp [edi*4+widths],0; je reject; cmp [edx*4+heights],0; je reject; cmp [ecx*4+rates],0; je reject
+    // followed by mov eax, [esi+count].
+    uintptr_t init = Export("?Init@Renderer@@QAE_NI_NIII00@Z");
     if (g_cfg.allModes) {
-        Expect e;
-        e.Bytes({0x83, 0x3C, 0xBD}).Addr(kWidthTable).Bytes({0x00, 0x74, 0x21, 0x83, 0x3C, 0x95});
-        e.Addr(kHeightTable).Bytes({0x00, 0x74, 0x17, 0x83, 0x3C, 0x8D}).Addr(kRefreshTable).Bytes({0x00, 0x74, 0x0D});
-        Reroute("display mode list", kModeFilter, e, &ModeStub);
+        uintptr_t site = FindOne(init, 0x600,
+                                 Pattern("83 3C BD ?? ?? ?? ?? 00 74 ?? 83 3C 95 ?? ?? ?? ?? 00 74 ?? "
+                                         "83 3C 8D ?? ?? ?? ?? 00 74 ?? 8B 86 ?? ?? ?? ??"));
+        if (site) {
+            g_retModeAccept = Noted("mode.accept", site + 30);
+            g_retModeReject = Noted("mode.reject", site + 30 + S8(site + 29));
+            g_offModeCount = U32(site + 32);
+            g_offModes = g_offModeCount + 4;
+            Noted("off.modeCount", g_offModeCount);
+        }
+        Report("display mode list", Jump(Noted("mode", site), 5, &ModeStub));
     }
     if (g_cfg.width > 0 && g_cfg.height > 0) {
-        const uint8_t pro[] = {0x55, 0x8B, 0xEC, 0x81, 0xEC, 0x24, 0x01, 0x00, 0x00};  // push ebp; mov ebp,esp; sub esp,124h
-        g_origInit = reinterpret_cast<InitFn>(hook::Detour(At(kRendererInit), &InitHook, sizeof pro, pro));
-        Log("forced resolution: %s", g_origInit ? "hooked" : "NOT hooked");
+        bool ok = init && Pattern("55 8B EC 81 EC ?? ?? ?? ??").At(init);  // push ebp; mov ebp,esp; sub esp,imm32
+        if (ok) g_origInit = reinterpret_cast<InitFn>(hook::Detour(init, &InitHook, 9, reinterpret_cast<uint8_t*>(init)));
+        Report("forced resolution", g_origInit != nullptr);
     }
     if (g_cfg.fixAspect || g_cfg.fixUI) {
-        const uint8_t pro[] = {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x08};  // push ebp; mov ebp,esp; sub esp,8
-        g_origSetViewport = reinterpret_cast<SetViewportFn>(hook::Detour(At(kSetViewport), &SetViewportHook, sizeof pro, pro));
-        Log("real aspect ratio: %s", g_origSetViewport ? "hooked" : "NOT hooked");
+        uintptr_t f = Export("?SetViewport@Renderer@@QAEXIIII@Z");
+        bool ok = f && Pattern("55 8B EC 83 EC ??").At(f);  // push ebp; mov ebp,esp; sub esp,imm8
+        if (ok)
+            g_origSetViewport = reinterpret_cast<SetViewportFn>(
+                hook::Detour(f, &SetViewportHook, 6, reinterpret_cast<uint8_t*>(f)));
+        Report("real aspect ratio", g_origSetViewport != nullptr);
     }
-    if (g_cfg.fixAspect && BytesAt(kDropAspectEnd, {0xD8, 0x4D, 0x08})) {  // fmul dword ptr [ebp+8]
-        g_retDrop = At(kDropAspectEnd);
-        Reroute("bullet-drop markers", kDropAspect, Expect().Bytes({0xD9, 0x80, 0x9C, 0x40, 0x01, 0x00}), &DropStub);
+
+    // Camera::UpdateCachedData: cmp [eax+wide],0; movss xmm0,[esi+fov]; movss [ebp-4],xmm0;
+    //   movss xmm0,[eax+aspect]; movss [ebp-0xc],xmm0; je end
+    {
+        uintptr_t f = Export("?UpdateCachedData@Camera@@QAEXXZ");
+        uintptr_t site = FindOne(f, 0x600,
+                                 Pattern("80 B8 ?? ?? ?? ?? 00 F3 0F 10 86 ?? ?? ?? ?? F3 0F 11 45 FC "
+                                         "F3 0F 10 80 ?? ?? ?? ?? F3 0F 11 45 F4 74 ??"),
+                                 [](uintptr_t a) {
+                                     return U32(a + 2) == g_offWide && U32(a + 11) == g_offCamFov &&
+                                            U32(a + 24) == g_offAspect;
+                                 });
+        if (site) g_retCamera = Noted("camera.end", site + 35 + S8(site + 34));
+        Report("camera FOV", Jump(Noted("camera", site), 7, &CameraStub));
+    }
+    // EffectManager::advanceTimeFov: cmp [edx+wide],0; je end; fld [ebp-4] ... end: movss [edi+x], xmm0
+    {
+        uintptr_t end = 0;
+        uintptr_t site = WideBlock("?advanceTimeFov@EffectManager@@QAEXMPAVActor@@PAVcsControllerActorPlayer@@@Z",
+                                   0x800, "80 BA ?? ?? ?? ?? 00 74 ?? D9 45 FC", 7, &end);
+        if (site && !Pattern("F3 0F 11").At(end)) site = 0;
+        g_retEffect = Noted("effect.end", end);
+        Report("player FOV", Jump(Noted("effect", site), 7, &EffectStub));
+    }
+    // ViewTrigger::IsInActiveRange: cmp [ecx+wide],0; je end; fld [ebp+8] ...
+    {
+        uintptr_t end = 0;
+        uintptr_t site = WideBlock("?IsInActiveRange@ViewTrigger@@UAE_NPAVControllableObject@@@Z", 0x400,
+                                   "80 B9 ?? ?? ?? ?? 00 74 ?? D9 45 08", 7, &end);
+        g_retTrigger = Noted("trigger.end", end);
+        Report("view trigger FOV", Jump(Noted("trigger", site), 7, &TriggerStub));
+    }
+    // wsModeAimWeapon::ChangeDropMarkers: fld [eax+aspect]; fmul [ebp+8]
+    if (g_cfg.fixAspect) {
+        uintptr_t site = FindOne(Export("?ChangeDropMarkers@wsModeAimWeapon@@IAEXM@Z"), 0x400,
+                                 Pattern("D9 80 ?? ?? ?? ?? D8 4D 08"),
+                                 [](uintptr_t a) { return U32(a + 2) == g_offAspect; });
+        if (site) g_retDrop = Noted("drop.end", site + 6);
+        Report("bullet-drop markers", Jump(Noted("drop", site), 6, &DropStub));
     }
     if (g_cfg.fixUI) {
-        if (BytesAt(kGuiAspectEnd, {0x8B, 0x91, 0xF8})) {  // mov edx, [ecx+0x2f8]
-            g_retGuiAspect = At(kGuiAspectEnd);
-            Expect e;
-            e.Bytes({0xF3, 0x0F, 0x10, 0x05}).Addr(kConst169);  // movss xmm0, [0.5625]
-            Reroute("UI aspect", kGuiAspect, e, &GuiAspectStub);
-        }
-        bool scope = Redirect(kScopeDiv, {0xDC, 0x35}, kConstScopeDiv, &g_scopeDiv);  // fdiv qword ptr [1280]
-        Log("scope overlay size: %s", scope ? "patched" : "NOT patched (unexpected code)");
+        // Gui::SetPhysicalViewport: fld [0.666]; fcomip st(2); fstp st(1); jbe x; movss xmm0,[0.5625]; jmp end
+        // (width and height were stored to [ebp+8] / [ebp+0xc] as floats before).
+        uintptr_t f = Export("?SetPhysicalViewport@Gui@@QAEXIIM@Z");
+        uintptr_t m = FindOne(f, 0x200, Pattern("DD 05 ?? ?? ?? ?? DF F2 DD D9 76 ?? F3 0F 10 05 ?? ?? ?? ?? EB ??"),
+                              [](uintptr_t a) { return Same(F64At(a + 2), 0.666f) && Same(F32At(a + 16), 0.5625); });
+        bool stores = m && Contains(f, m - f, Pattern("D9 5D 08")) && Contains(f, m - f, Pattern("D9 5D 0C"));
+        uintptr_t site = stores ? m + 12 : 0;
+        if (site) g_retGuiAspect = Noted("gui.end", m + 22 + S8(m + 21));
+        Report("UI aspect", Jump(Noted("gui", site), 8, &GuiAspectStub));
+
+        // wsModeHudBase::RenderHUD sizes the scope overlay as width * 1024 / 1280: fdiv qword ptr [1280]
+        uintptr_t scope = FindOne(Export("?RenderHUD@wsModeHudBase@@UAEXXZ"), 0x200, Pattern("DC 35 ?? ?? ?? ??"),
+                                  [](uintptr_t a) { return Same(F64At(a + 2), 1280.0); });
+        Report("scope overlay size", scope && hook::WritePtr(reinterpret_cast<void*>(Noted("scope", scope + 2)), &g_scopeDiv));
     }
     if (g_cfg.crosshairFov) {
-        bool xhair = Redirect(kCrosshairMul, {0xDC, 0x0D}, kConstCrosshair, &g_crosshairMul);  // fmul qword ptr [42]
-        Log("crosshair FOV scaling: %s", xhair ? "patched" : "NOT patched (unexpected code)");
+        // PlayerHud::Crosshair_AdvanceTime: fadd st,st; fstp [ebp-x]; fld [ebp-x]; fmul qword ptr [42]
+        uintptr_t m = FindOne(Export("?Crosshair_AdvanceTime@PlayerHud@@IAEXM@Z"), 0xA00,
+                              Pattern("DC C0 D9 5D ?? D9 45 ?? DC 0D ?? ?? ?? ??"),
+                              [](uintptr_t a) { return Same(F64At(a + 10), 42.0); });
+        Report("crosshair FOV scaling",
+               m && hook::WritePtr(reinterpret_cast<void*>(Noted("crosshair", m + 10)), &g_crosshairMul));
     }
+
+    // Deferred ambient passes: movss xmm0, [-7000] / movss xmm1, [7000] near the start.
     int quad = 0;
+    const char* shadeFuncs[] = {"?RenderShadeAmbient@Renderer@@IAEXI@Z", "?RenderShadeAmbientDirectional@Renderer@@IAEXI@Z"};
+    static const char* quadNames[] = {"quad0", "quad1", "quad2", "quad3"};
     for (int i = 0; i < 2; i++) {
-        quad += Redirect(kQuadNeg[i], {0xF3, 0x0F, 0x10, 0x05}, kQuadNegConst, &g_quadNeg);  // movss xmm0, [-7000]
-        quad += Redirect(kQuadPos[i], {0xF3, 0x0F, 0x10, 0x0D}, kQuadPosConst, &g_quadPos);  // movss xmm1, [7000]
+        uintptr_t f = Export(shadeFuncs[i]);
+        uintptr_t neg = FindOne(f, 0x80, Pattern("F3 0F 10 05 ?? ?? ?? ??"), [](uintptr_t a) { return Same(F32At(a + 4), -7000.0); });
+        uintptr_t pos = FindOne(f, 0x80, Pattern("F3 0F 10 0D ?? ?? ?? ??"), [](uintptr_t a) { return Same(F32At(a + 4), 7000.0); });
+        quad += neg && hook::WritePtr(reinterpret_cast<void*>(Noted(quadNames[2 * i], neg + 4)), &g_quadNeg);
+        quad += pos && hook::WritePtr(reinterpret_cast<void*>(Noted(quadNames[2 * i + 1], pos + 4)), &g_quadPos);
     }
     Log("ambient shading quad: %d of 4 patched", quad);
-    Reroute("camera FOV", kCameraFov, Expect().Bytes({0x80, 0xB8, 0xAC, 0x40, 0x01, 0x00, 0x00}), &CameraStub);
-    Reroute("player FOV", kEffectFov, Expect().Bytes({0x80, 0xBA, 0xAC, 0x40, 0x01, 0x00, 0x00}), &EffectStub);
-    Reroute("view trigger FOV", kTriggerFov, Expect().Bytes({0x80, 0xB9, 0xAC, 0x40, 0x01, 0x00, 0x00}), &TriggerStub);
 
+    // Grass extents: fdiv qword ptr [4/3] shortly before fdiv dword ptr [esi+aspect].
     int grass = 0;
-    for (uintptr_t site : kGrass43) {
-        Expect e;
-        e.Bytes({0xDC, 0x35}).Addr(kConst43);  // fdiv qword ptr [4/3]
-        if (std::memcmp(reinterpret_cast<void*>(At(site)), e.b, e.n) == 0 &&
-            hook::WritePtr(reinterpret_cast<void*>(At(site) + 2), &g_basis43))
-            grass++;
+    const char* grassFuncs[] = {
+        "?RenderSolid@Renderer@@IAEXPAV?$SimpleListDynamic@PAUGEOMETRY_RECORD@@$03@@I@Z",
+        "?RenderTextured@Renderer@@IAEXPAV?$SimpleListDynamic@PAUGEOMETRY_RECORD@@$03@@I@Z",
+        "?RenderNormalWii@Renderer@@IAEXPAV?$SimpleListDynamic@PAUGEOMETRY_RECORD@@$03@@I@Z",
+        "?RenderDefer@Renderer@@IAEXPAV?$SimpleListDynamic@PAUGEOMETRY_RECORD@@$03@@I@Z",
+    };
+    static const char* grassNames[] = {"grass0", "grass1", "grass2", "grass3"};
+    for (const char* fn : grassFuncs) {
+        uintptr_t site = FindOne(Export(fn), 0x1000, Pattern("DC 35 ?? ?? ?? ??"), [](uintptr_t a) {
+            if (!Same(F64At(a + 2), 4.0f / 3.0f)) return false;
+            Pattern aspectDiv("D8 B6 ?? ?? ?? ??");
+            for (uintptr_t b = a + 6; b < a + 0x30; b++)
+                if (aspectDiv.At(b) && U32(b + 2) == g_offAspect) return true;
+            return false;
+        });
+        if (site && hook::WritePtr(reinterpret_cast<void*>(Noted(grassNames[grass], site + 2)), &g_basis43)) grass++;
     }
     Log("grass extents: %d of 4 patched", grass);
     return true;
@@ -449,4 +588,10 @@ bool InstallPatches() {
 extern "C" __declspec(dllexport) void dh2013ws_test_setfov(float deg) { SetUserFov(deg); }
 extern "C" __declspec(dllexport) void dh2013ws_test_zoomblend(float z) { g_cfg.zoomBlend = z; }
 extern "C" __declspec(dllexport) void dh2013ws_test_crosshairmin(float s) { g_cfg.crosshairMinScale = s; }
+// Address (or offset) the mod found for `name` at startup, 0 if none.
+extern "C" __declspec(dllexport) uintptr_t dh2013ws_test_note(const char* name) {
+    for (int i = 0; i < g_noteCount; i++)
+        if (std::strcmp(g_notes[i].name, name) == 0) return g_notes[i].value;
+    return 0;
+}
 #endif

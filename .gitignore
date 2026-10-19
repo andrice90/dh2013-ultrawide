@@ -1,4 +1,9 @@
 build/
-re/*.txt
+dist/
 *.log
 __pycache__/
+# reverse-engineering output (derived from the game's files, which must not be redistributed)
+re/*.txt
+re/extracted/
+*.dll
+*.exe

@@ -1,9 +1,11 @@
-// Cabela's Dangerous Hunts 2013 (demo) widescreen mod: shared declarations.
+// Cabela's Dangerous Hunts 2013 widescreen mod: shared declarations.
 #pragma once
 #include <windows.h>
 #include <cstdint>
 
-// ---- config (dh2013ws.ini next to dh_2013_demo.exe) -------------------------
+#define DH2013WS_VERSION "1.2.0"
+
+// ---- config (dh2013ws.ini next to dinput8.dll in the game folder) -----------
 struct Config {
     // [Display]
     bool allModes = true;  // list every display mode the monitor offers (the game whitelists up to 2560 wide)

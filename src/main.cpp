@@ -1,4 +1,4 @@
-// Cabela's Dangerous Hunts 2013 (demo) widescreen mod: dinput8.dll proxy, config, log, startup.
+// Cabela's Dangerous Hunts 2013 widescreen mod: dinput8.dll proxy, config, log, startup.
 // CloakNTEngine.dll (the engine) imports dinput8.dll, so this DLL initialises before the engine runs any code.
 #include "dh2013ws.h"
 #include <cstdio>
@@ -14,8 +14,9 @@ static char g_logPath[MAX_PATH];
 static CRITICAL_SECTION g_logLock;
 static bool g_installed;
 
-// Steam demo build (app 225580) of CloakNTEngine.dll (PE TimeDateStamp). Patch offsets are only valid for it.
-static const DWORD kEngineStamp = 1353949478;
+// CloakNTEngine.dll (PE TimeDateStamp) of the Steam demo (app 225580), where every patch was verified. Other
+// builds (the full game, app 218860) are patched wherever the code matches; the log lists each patch.
+static const DWORD kTestedEngineStamp = 1353949478;
 
 void Log(const char* fmt, ...) {
     if (!g_cfg.log || !g_logPath[0]) return;
@@ -87,11 +88,9 @@ static void TryInstall() {
     g_engine = reinterpret_cast<uintptr_t>(GetModuleHandleA("CloakNTEngine.dll"));
     if (!g_engine) return;
     g_installed = true;
-    if (Stamp(g_engine) != kEngineStamp) {
-        Log("unsupported CloakNTEngine.dll (timestamp %u, expected %u): mod disabled", Stamp(g_engine), kEngineStamp);
-        return;
-    }
-    Log("CloakNTEngine.dll at %08X", static_cast<unsigned>(g_engine));
+    DWORD stamp = Stamp(g_engine);
+    Log("CloakNTEngine.dll at %08X, build %u (%s)", static_cast<unsigned>(g_engine), stamp,
+        stamp == kTestedEngineStamp ? "Steam demo, verified" : "not the demo build: patching what matches");
     InstallPatches();
 }
 
@@ -161,7 +160,7 @@ static void Startup(HMODULE self) {
     sprintf_s(g_logPath, "%sdh2013ws.log", dir);
     LoadConfig();
     DeleteFileA(g_logPath);
-    Log("dh2013ws %s %s (module %p)", __DATE__, __TIME__, self);
+    Log("dh2013ws %s (built %s %s, module %p)", DH2013WS_VERSION, __DATE__, __TIME__, self);
     TryInstall();
     if (!g_installed) Log("CloakNTEngine.dll not loaded yet: patching on first DirectInput8Create");
 }

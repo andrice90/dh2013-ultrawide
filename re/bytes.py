@@ -1,7 +1,16 @@
-import pefile,sys
-pe=pefile.PE("D:/SteamLibrary/steamapps/common/Cabela's Dangerous Hunts Demo/CloakNTEngine.dll",fast_load=True); img=pe.get_memory_mapped_image(); b=pe.OPTIONAL_HEADER.ImageBase
-print("timestamp", pe.FILE_HEADER.TimeDateStamp, "SizeOfImage", hex(pe.OPTIONAL_HEADER.SizeOfImage), "checksum", hex(pe.OPTIONAL_HEADER.CheckSum))
-for s in sys.argv[1:]:
-    a,n=s.split(':'); a=int(a,16); n=int(n,16)
-    bs=img[a-b:a-b+n]
-    print("%08x rva %06x [%d] %s"%(a,a-b,n,', '.join('0x%02X'%x for x in bs)))
+"""Prints CloakNTEngine.dll bytes as C initialisers (for the patch expectations), plus the PE timestamp.
+
+usage: py re/bytes.py VA:HEXLEN ...
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _engine import Engine  # noqa: E402
+
+e = Engine()
+print('timestamp', e.pe.FILE_HEADER.TimeDateStamp, 'SizeOfImage', hex(e.pe.OPTIONAL_HEADER.SizeOfImage))
+for spec in sys.argv[1:]:
+    a, n = spec.split(':')
+    a, n = int(a, 16), int(n, 16)
+    print('%08x rva %06x [%d] %s' % (a, a - e.base, n, ', '.join('0x%02X' % x for x in e.read(a, n))))
